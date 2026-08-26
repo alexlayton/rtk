@@ -4,36 +4,16 @@
 //! represented faithfully as a direct process invocation. Unsupported tools
 //! and shell syntax are executed unchanged by the platform shell.
 
+pub use crate::core::process::CancellationToken;
+use crate::core::process::{capture_command, ProcessControl};
 use crate::core::stream::status_to_exit_code;
 use crate::core::utils::decode_process_output;
 use crate::shell_lexer::{self, TokenKind};
 use crate::wc_cmd;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::process::Command;
 use std::time::Duration;
-
-/// Runtime-neutral cancellation signal for an embedded command execution.
-#[derive(Debug, Clone, Default)]
-pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
-}
-
-impl CancellationToken {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-}
 
 /// Options controlling an embedded command execution.
 #[derive(Debug, Clone, Default)]
@@ -122,19 +102,21 @@ pub fn execute_with_options(command: &str, options: &ExecuteOptions) -> Result<E
         None => std::env::current_dir().context("Failed to determine command working directory")?,
     };
 
+    let control = ProcessControl::new(options.timeout, options.cancellation.clone());
     if let Some(words) = plain_words(command) {
-        if let Some(result) = execute_filtered(&words, &cwd, options.tracking)? {
+        if let Some(result) = execute_filtered(&words, &cwd, options.tracking, &control)? {
             return Ok(result);
         }
     }
 
-    execute_shell(command, &cwd)
+    execute_shell(command, &cwd, &control)
 }
 
 fn execute_filtered(
     words: &[String],
     cwd: &Path,
     tracking: bool,
+    control: &ProcessControl,
 ) -> Result<Option<ExecutionResult>> {
     let Some((tool, args)) = words.split_first() else {
         return Ok(None);
@@ -144,7 +126,7 @@ fn execute_filtered(
         // A bare `wc` reads stdin. The embedded API does not accept stdin yet,
         // so leave that case to the shell executor, whose stdin is null.
         "wc" if has_file_operand(args) => {
-            let captured = wc_cmd::capture(args, cwd, tracking)
+            let captured = wc_cmd::capture(args, cwd, tracking, control)
                 .context("Failed to execute filtered wc command")?;
             Ok(Some(ExecutionResult {
                 stdout: captured.stdout,
@@ -196,20 +178,16 @@ fn plain_words(command: &str) -> Option<Vec<String>> {
     Some(tokens.into_iter().map(|token| token.value).collect())
 }
 
-fn execute_shell(command: &str, cwd: &Path) -> Result<ExecutionResult> {
+fn execute_shell(command: &str, cwd: &Path, control: &ProcessControl) -> Result<ExecutionResult> {
     #[cfg(windows)]
     let (shell, flag) = ("cmd", "/C");
     #[cfg(not(windows))]
     let (shell, flag) = ("sh", "-c");
 
-    let output = Command::new(shell)
-        .arg(flag)
-        .arg(command)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    let mut shell_command = Command::new(shell);
+    shell_command.arg(flag).arg(command).current_dir(cwd);
+    let output = capture_command(&mut shell_command, control)
+        .map_err(anyhow::Error::new)
         .with_context(|| format!("Failed to execute command through {shell}"))?;
 
     Ok(ExecutionResult {
@@ -271,6 +249,74 @@ mod tests {
 
         assert_eq!(result.stdout, "fallback");
         assert_eq!(result.route, ExecutionRoute::ShellPassthrough);
+    }
+
+    #[test]
+    fn timeout_stops_a_running_shell_command() {
+        let options = ExecuteOptions::default().with_timeout(Duration::from_millis(50));
+        #[cfg(windows)]
+        let command = "ping -n 6 127.0.0.1 >NUL";
+        #[cfg(not(windows))]
+        let command = "sleep 5";
+
+        let error = execute_with_options(command, &options).expect_err("command should time out");
+
+        assert!(format!("{error:#}").contains("timed out"));
+    }
+
+    #[test]
+    fn cancellation_stops_a_running_shell_command() {
+        let cancellation = CancellationToken::new();
+        let options = ExecuteOptions::default().with_cancellation(cancellation.clone());
+        #[cfg(windows)]
+        let command = "ping -n 6 127.0.0.1 >NUL";
+        #[cfg(not(windows))]
+        let command = "sleep 5";
+
+        let worker = std::thread::spawn(move || execute_with_options(command, &options));
+        std::thread::sleep(Duration::from_millis(50));
+        cancellation.cancel();
+        let error = worker
+            .join()
+            .expect("execution thread")
+            .expect_err("command should be cancelled");
+
+        assert!(format!("{error:#}").contains("cancelled"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_shell_descendants() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let options = ExecuteOptions::default()
+            .with_cwd(temp.path())
+            .with_timeout(Duration::from_millis(100));
+        let command = "sh -c 'sleep 30 & echo $! > child.pid; wait'";
+
+        let error = execute_with_options(command, &options).expect_err("command should time out");
+        assert!(format!("{error:#}").contains("timed out"));
+        let pid = fs::read_to_string(temp.path().join("child.pid"))
+            .expect("child pid file")
+            .trim()
+            .to_string();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline
+            && Command::new("kill")
+                .args(["-0", &pid])
+                .status()
+                .is_ok_and(|status| status.success())
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = Command::new("kill")
+            .args(["-0", &pid])
+            .status()
+            .expect("probe descendant");
+        assert!(
+            !status.success(),
+            "descendant process {pid} survived timeout"
+        );
     }
 
     #[test]

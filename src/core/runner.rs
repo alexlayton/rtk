@@ -107,6 +107,7 @@ fn capture_filtered<F>(
     filter_fn: F,
     opts: &RunOptions<'_>,
     track: bool,
+    control: Option<&crate::core::process::ProcessControl>,
 ) -> Result<CapturedRun>
 where
     F: Fn(&str, i32) -> String,
@@ -117,8 +118,13 @@ where
     } else {
         StdinMode::Null
     };
-    let result = stream::run_streaming(&mut cmd, stdin_mode, FilterMode::CaptureOnly)
-        .with_context(|| format!("Failed to run {}", tool_name))?;
+    let result = match control {
+        Some(control) => stream::run_capture_controlled(&mut cmd, control)
+            .map_err(anyhow::Error::new)
+            .with_context(|| format!("Failed to run {}", tool_name))?,
+        None => stream::run_streaming(&mut cmd, stdin_mode, FilterMode::CaptureOnly)
+            .with_context(|| format!("Failed to run {}", tool_name))?,
+    };
 
     let exit_code = result.exit_code;
     let raw = &result.raw;
@@ -206,7 +212,7 @@ fn run_captured_filter<F>(
 where
     F: Fn(&str, i32) -> String,
 {
-    let result = capture_filtered(cmd, tool_name, cmd_label, filter_fn, &opts, true)?;
+    let result = capture_filtered(cmd, tool_name, cmd_label, filter_fn, &opts, true, None)?;
     print_captured(&result, &opts);
     Ok(result.exit_code)
 }
@@ -295,6 +301,33 @@ where
         move |text, _| filter_fn(text),
         &opts,
         track,
+        None,
+    )
+}
+
+/// Execute and filter without printing, with timeout and cancellation control.
+#[allow(dead_code)]
+pub fn run_filtered_capture_controlled<F>(
+    cmd: Command,
+    tool_name: &str,
+    args_display: &str,
+    filter_fn: F,
+    opts: RunOptions<'_>,
+    track: bool,
+    control: &crate::core::process::ProcessControl,
+) -> Result<CapturedRun>
+where
+    F: Fn(&str) -> String,
+{
+    let cmd_label = format!("{} {}", tool_name, args_display);
+    capture_filtered(
+        cmd,
+        tool_name,
+        &cmd_label,
+        move |text, _| filter_fn(text),
+        &opts,
+        track,
+        Some(control),
     )
 }
 

@@ -41,18 +41,24 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 // Used by the library target's execution router; the legacy binary target
 // compiles this module separately and continues to call `run` above.
 #[allow(dead_code)]
-pub(crate) fn capture(args: &[String], cwd: &Path, track: bool) -> Result<CapturedRun> {
+pub(crate) fn capture(
+    args: &[String],
+    cwd: &Path,
+    track: bool,
+    control: &crate::core::process::ProcessControl,
+) -> Result<CapturedRun> {
     let mut cmd = build_command(args);
     cmd.current_dir(cwd);
     let mode = detect_mode(args);
 
-    runner::run_filtered_capture(
+    runner::run_filtered_capture_controlled(
         cmd,
         "wc",
         &args.join(" "),
         |stdout| filter_wc_output(stdout, &mode),
         RunOptions::stdout_only().early_exit_on_failure(),
         track,
+        control,
     )
 }
 

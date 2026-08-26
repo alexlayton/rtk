@@ -276,6 +276,23 @@ pub fn status_to_exit_code(status: std::process::ExitStatus) -> i32 {
 // ISSUE #897: ChildGuard RAII prevents zombie processes that caused kernel panic
 pub const RAW_CAP: usize = 10_485_760; // 10 MiB
 
+pub fn run_capture_controlled(
+    cmd: &mut Command,
+    control: &crate::core::process::ProcessControl,
+) -> std::result::Result<StreamResult, crate::core::process::ProcessError> {
+    let output = crate::core::process::capture_command(cmd, control)?;
+    let raw_stdout = super::utils::decode_process_output(&output.stdout);
+    let raw_stderr = super::utils::decode_process_output(&output.stderr);
+    let raw = format!("{}{}", raw_stdout, raw_stderr);
+    Ok(StreamResult {
+        exit_code: status_to_exit_code(output.status),
+        raw,
+        filtered: raw_stdout.clone(),
+        raw_stdout,
+        raw_stderr,
+    })
+}
+
 pub fn run_streaming(
     cmd: &mut Command,
     stdin_mode: StdinMode,

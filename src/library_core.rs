@@ -10,6 +10,8 @@ pub mod config;
 pub mod constants;
 #[path = "core/guard.rs"]
 pub mod guard;
+#[path = "core/process.rs"]
+pub mod process;
 #[path = "core/runner.rs"]
 pub mod runner;
 #[path = "core/stream.rs"]

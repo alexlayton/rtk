@@ -41,6 +41,7 @@ flate2 = "1.0"
 quick-xml = "0.37"
 which = "8"
 automod = "1"
+command-group = "5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
