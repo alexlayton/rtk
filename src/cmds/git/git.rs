@@ -9,11 +9,10 @@ use crate::core::stream::{
 };
 use crate::core::tracking;
 use crate::core::truncate::{CAP_LIST, CAP_WARNINGS};
-use crate::core::utils::{
-    exit_code_from_status, join_with_overflow, resolved_command, strip_ansi,
-};
+use crate::core::utils::{exit_code_from_status, join_with_overflow, resolved_command, strip_ansi};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
+use std::path::Path;
 use std::process::Command;
 
 #[derive(Debug, Clone)]
@@ -107,6 +106,307 @@ pub fn run(
         }
         GitCommand::Worktree => run_worktree(args, verbose, global_args),
     }
+}
+
+// Embedded, non-printing routes for high-value read-only git commands.
+#[allow(dead_code)]
+pub(crate) fn capture(
+    command: GitCommand,
+    args: &[String],
+    cwd: &Path,
+    track: bool,
+    control: &crate::core::process::ProcessControl,
+) -> Result<runner::CapturedRun> {
+    match command {
+        GitCommand::Status => capture_status(args, cwd, track, control),
+        GitCommand::Diff => capture_diff(args, cwd, track, control),
+        GitCommand::Log => capture_log(args, cwd, track, control),
+        GitCommand::Show => capture_show(args, cwd, track, control),
+        _ => anyhow::bail!("git route is not available through the embedded API"),
+    }
+}
+
+fn capture_git_command(
+    mut command: Command,
+    cwd: &Path,
+    control: &crate::core::process::ProcessControl,
+) -> Result<stream::StreamResult> {
+    command.current_dir(cwd);
+    stream::run_capture_controlled(&mut command, control)
+        .map_err(anyhow::Error::new)
+        .context("Failed to run git command")
+}
+
+fn raw_capture(result: stream::StreamResult) -> runner::CapturedRun {
+    runner::CapturedRun {
+        stdout: result.raw_stdout,
+        stderr: result.raw_stderr,
+        exit_code: result.exit_code,
+        filtered: false,
+        stdout_truncated: result.stdout_truncated,
+        stderr_truncated: result.stderr_truncated,
+    }
+}
+
+fn filtered_capture(
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) -> runner::CapturedRun {
+    runner::CapturedRun {
+        stdout,
+        stderr,
+        exit_code,
+        filtered: true,
+        stdout_truncated,
+        stderr_truncated,
+    }
+}
+
+fn track_capture(track: bool, command: &str, raw: &str, filtered: &str) {
+    if track {
+        tracking::TimedExecution::start().track(command, &format!("rtk {command}"), raw, filtered);
+    }
+}
+
+fn capture_status(
+    args: &[String],
+    cwd: &Path,
+    track: bool,
+    control: &crate::core::process::ProcessControl,
+) -> Result<runner::CapturedRun> {
+    if !uses_compact_status_path(args) {
+        let result = capture_git_command(build_status_command(args, &[]), cwd, control)?;
+        if result.exit_code != 0 {
+            return Ok(raw_capture(result));
+        }
+        let filtered = filter_status_with_args(&result.raw_stdout);
+        let shown = never_worse(&result.raw_stdout, &filtered).to_string();
+        track_capture(track, "git status", &result.raw_stdout, &shown);
+        return Ok(filtered_capture(
+            shown,
+            result.raw_stderr,
+            result.exit_code,
+            result.stdout_truncated,
+            result.stderr_truncated,
+        ));
+    }
+
+    let mut raw_command = git_cmd_c_locale(&[]);
+    raw_command.arg("status").args(args);
+    let raw = capture_git_command(raw_command, cwd, control)?;
+    if raw.exit_code != 0 {
+        return Ok(raw_capture(raw));
+    }
+
+    let result = capture_git_command(build_status_command(args, &[]), cwd, control)?;
+    if result.exit_code != 0 {
+        return Ok(raw_capture(result));
+    }
+    let formatted = match extract_detached_head(&raw.raw_stdout) {
+        Some(detached_ref) => format_status_output_detached(&result.raw_stdout, &detached_ref),
+        None => format_status_output(&result.raw_stdout),
+    };
+    let filtered = match extract_state_header(&raw.raw_stdout) {
+        Some(state) => format!("{}\n{}", state, formatted),
+        None => formatted,
+    };
+    let shown = never_worse(&raw.raw_stdout, &filtered).to_string();
+    track_capture(track, "git status", &raw.raw_stdout, &shown);
+    Ok(filtered_capture(
+        shown,
+        format!("{}{}", raw.raw_stderr, result.raw_stderr),
+        0,
+        raw.stdout_truncated || result.stdout_truncated,
+        raw.stderr_truncated || result.stderr_truncated,
+    ))
+}
+
+fn capture_diff(
+    args: &[String],
+    cwd: &Path,
+    track: bool,
+    control: &crate::core::process::ProcessControl,
+) -> Result<runner::CapturedRun> {
+    let wants_stat = args
+        .iter()
+        .any(|arg| arg == "--stat" || arg == "--numstat" || arg == "--shortstat");
+    let wants_compact = !args.iter().any(|arg| arg == "--no-compact");
+    if wants_stat || !wants_compact {
+        let mut command = git_cmd(&[]);
+        command
+            .arg("diff")
+            .args(args.iter().filter(|arg| *arg != "--no-compact"));
+        return capture_git_command(command, cwd, control).map(raw_capture);
+    }
+
+    let mut stat_command = git_cmd(&[]);
+    stat_command.arg("diff").arg("--stat").args(args);
+    let stat = capture_git_command(stat_command, cwd, control)?;
+    if stat.exit_code != 0 {
+        return Ok(raw_capture(stat));
+    }
+    let mut diff_command = git_cmd(&[]);
+    diff_command.arg("diff").args(args);
+    let diff = capture_git_command(diff_command, cwd, control)?;
+    if diff.exit_code != 0 {
+        return Ok(raw_capture(diff));
+    }
+
+    let filtered = if diff.raw_stdout.is_empty() {
+        stat.raw_stdout.trim().to_string()
+    } else {
+        format!(
+            "{}\n\nChanges:\n{}",
+            stat.raw_stdout.trim(),
+            compact_diff(&diff.raw_stdout, 500)
+        )
+    };
+    let raw = format!("{}\n{}", stat.raw_stdout, diff.raw_stdout);
+    let shown = never_worse(&raw, &filtered).to_string();
+    track_capture(track, "git diff", &raw, &shown);
+    Ok(filtered_capture(
+        shown,
+        format!("{}{}", stat.raw_stderr, diff.raw_stderr),
+        0,
+        stat.stdout_truncated || diff.stdout_truncated,
+        stat.stderr_truncated || diff.stderr_truncated,
+    ))
+}
+
+fn capture_log(
+    args: &[String],
+    cwd: &Path,
+    track: bool,
+    control: &crate::core::process::ProcessControl,
+) -> Result<runner::CapturedRun> {
+    let mut command = git_cmd(&[]);
+    command.arg("log");
+    if requests_raw_log_output(args) {
+        command.args(args);
+        return capture_git_command(command, cwd, control).map(raw_capture);
+    }
+
+    let tokens = log_arg_tokens(args);
+    let flag_args = flag_args_from_tokens(&tokens);
+    let has_format_flag = flag_args.iter().any(|arg| {
+        arg.starts_with("--oneline") || arg.starts_with("--pretty") || arg.starts_with("--format")
+    });
+    let has_limit_flag = flag_args.iter().any(|arg| {
+        (arg.starts_with('-') && arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
+            || *arg == "-n"
+            || arg.starts_with("--max-count")
+    });
+    if !has_format_flag {
+        command.args(["--pretty=format:%h %s (%ar) <%an>%n%b%n---END---"]);
+    }
+    let (limit, user_set_limit) = if has_limit_flag {
+        (parse_limit_from_tokens(&tokens).unwrap_or(10), true)
+    } else if has_format_flag {
+        command.arg("-50");
+        (50, false)
+    } else {
+        command.arg("-10");
+        (10, false)
+    };
+    let wants_merges = flag_args
+        .iter()
+        .any(|arg| *arg == "--merges" || *arg == "--min-parents=2" || *arg == "--no-merges");
+    if !wants_merges && !has_limit_flag {
+        command.arg("--no-merges");
+    }
+    command.args(args);
+    let result = capture_git_command(command, cwd, control)?;
+    if result.exit_code != 0 {
+        return Ok(raw_capture(result));
+    }
+    let filtered = filter_log_output(&result.raw_stdout, limit, user_set_limit, has_format_flag);
+    let shown = never_worse(&result.raw_stdout, &filtered).to_string();
+    track_capture(track, "git log", &result.raw_stdout, &shown);
+    Ok(filtered_capture(
+        shown,
+        result.raw_stderr,
+        0,
+        result.stdout_truncated,
+        result.stderr_truncated,
+    ))
+}
+
+fn capture_show(
+    args: &[String],
+    cwd: &Path,
+    track: bool,
+    control: &crate::core::process::ProcessControl,
+) -> Result<runner::CapturedRun> {
+    let direct = args.iter().any(|arg| {
+        arg == "--stat"
+            || arg == "--numstat"
+            || arg == "--shortstat"
+            || arg.starts_with("--pretty")
+            || arg.starts_with("--format")
+            || is_blob_show_arg(arg)
+    });
+    let mut raw_command = git_cmd(&[]);
+    raw_command.arg("show").args(args);
+    let raw = capture_git_command(raw_command, cwd, control)?;
+    if raw.exit_code != 0 || direct {
+        return Ok(raw_capture(raw));
+    }
+
+    let mut summary_command = git_cmd(&[]);
+    summary_command
+        .args(["show", "--no-patch", "--pretty=format:%h %s (%ar) <%an>"])
+        .args(args);
+    let summary = capture_git_command(summary_command, cwd, control)?;
+    if summary.exit_code != 0 {
+        return Ok(raw_capture(summary));
+    }
+    let mut printed = summary.raw_stdout.trim().to_string();
+
+    let mut stat_command = git_cmd(&[]);
+    stat_command
+        .args(["show", "--stat", "--pretty=format:"])
+        .args(args);
+    let stat = capture_git_command(stat_command, cwd, control)?;
+    if stat.exit_code != 0 {
+        return Ok(raw_capture(stat));
+    }
+    if !stat.raw_stdout.trim().is_empty() {
+        printed.push('\n');
+        printed.push_str(stat.raw_stdout.trim());
+    }
+
+    let mut diff_command = git_cmd(&[]);
+    diff_command.args(["show", "--pretty=format:"]).args(args);
+    let diff = capture_git_command(diff_command, cwd, control)?;
+    if diff.exit_code != 0 {
+        return Ok(raw_capture(diff));
+    }
+    if !diff.raw_stdout.trim().is_empty() {
+        printed.push('\n');
+        printed.push_str(&compact_diff(diff.raw_stdout.trim(), 500));
+    }
+
+    let shown = never_worse(&raw.raw_stdout, &printed).to_string();
+    track_capture(track, "git show", &raw.raw_stdout, &shown);
+    Ok(filtered_capture(
+        shown,
+        format!(
+            "{}{}{}{}",
+            raw.raw_stderr, summary.raw_stderr, stat.raw_stderr, diff.raw_stderr
+        ),
+        0,
+        raw.stdout_truncated
+            || summary.stdout_truncated
+            || stat.stdout_truncated
+            || diff.stdout_truncated,
+        raw.stderr_truncated
+            || summary.stderr_truncated
+            || stat.stderr_truncated
+            || diff.stderr_truncated,
+    ))
 }
 
 fn run_diff(
@@ -3076,7 +3376,11 @@ A  added.rs
 
     #[test]
     fn test_real_flag_args_keeps_genuine_flags() {
-        let args = vec!["--grep".to_string(), "fix".to_string(), "--oneline".to_string()];
+        let args = vec![
+            "--grep".to_string(),
+            "fix".to_string(),
+            "--oneline".to_string(),
+        ];
         assert_eq!(real_flag_args(&args), vec!["--grep", "--oneline"]);
     }
 
@@ -3086,9 +3390,8 @@ A  added.rs
         // string "-5"; it is not a request to limit output to 5 commits.
         let args = vec!["--grep".to_string(), "-5".to_string()];
         assert!(
-            !real_flag_args(&args)
-                .iter()
-                .any(|arg| arg.starts_with('-') && arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit())),
+            !real_flag_args(&args).iter().any(|arg| arg.starts_with('-')
+                && arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit())),
             "-5 as the value of --grep should not be seen as a limit flag"
         );
         assert_eq!(
@@ -3126,11 +3429,7 @@ A  added.rs
     fn test_parse_user_limit_skips_foreign_option_values() {
         // A real limit later in the args is still found after a
         // value-taking option's value is skipped.
-        let args = vec![
-            "--grep".to_string(),
-            "-5".to_string(),
-            "-20".to_string(),
-        ];
+        let args = vec!["--grep".to_string(), "-5".to_string(), "-20".to_string()];
         assert_eq!(parse_user_limit(&args), Some(20));
     }
 

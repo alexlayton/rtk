@@ -4,12 +4,15 @@
 //! represented faithfully as a direct process invocation. Unsupported tools
 //! and shell syntax are executed unchanged by the platform shell.
 
+use crate::cargo_cmd::{self, CargoCommand};
 pub use crate::core::process::CancellationToken;
 use crate::core::process::{capture_command, Interruption, ProcessControl, ProcessError};
+use crate::core::runner::CapturedRun;
 use crate::core::stream::status_to_exit_code;
 use crate::core::utils::decode_process_output;
+use crate::git_cmd::{self, GitCommand};
 use crate::shell_lexer::{self, TokenKind};
-use crate::wc_cmd;
+use crate::{test_runner, wc_cmd};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -243,24 +246,82 @@ fn execute_filtered(
     match tool.as_str() {
         // A bare `wc` reads stdin. The embedded API does not accept stdin yet,
         // so leave that case to the shell executor, whose stdin is null.
-        "wc" if has_file_operand(args) => {
-            let captured =
-                wc_cmd::capture(args, cwd, tracking, control).map_err(map_embedded_error)?;
-            Ok(Some(ExecutionResult {
-                stdout: captured.stdout,
-                stderr: captured.stderr,
-                exit_code: captured.exit_code,
-                stdout_truncated: captured.stdout_truncated,
-                stderr_truncated: captured.stderr_truncated,
-                route: if captured.filtered {
-                    ExecutionRoute::Filtered { tool: "wc" }
-                } else {
-                    ExecutionRoute::DirectPassthrough { tool: "wc" }
-                },
-            }))
+        "wc" if has_file_operand(args) => wc_cmd::capture(args, cwd, tracking, control)
+            .map(|captured| execution_from_capture(captured, "wc"))
+            .map(Some)
+            .map_err(map_embedded_error),
+        "git" => {
+            let Some((subcommand, command_args)) = args.split_first() else {
+                return Ok(None);
+            };
+            let command = match subcommand.as_str() {
+                "status" => GitCommand::Status,
+                "diff" => GitCommand::Diff,
+                "log" => GitCommand::Log,
+                "show" => GitCommand::Show,
+                _ => return Ok(None),
+            };
+            git_cmd::capture(command, command_args, cwd, tracking, control)
+                .map(|captured| execution_from_capture(captured, "git"))
+                .map(Some)
+                .map_err(map_embedded_error)
+        }
+        "cargo" => {
+            let Some((subcommand, command_args)) = args.split_first() else {
+                return Ok(None);
+            };
+            let command = match subcommand.as_str() {
+                "build" => CargoCommand::Build,
+                "check" => CargoCommand::Check,
+                "test" => CargoCommand::Test,
+                _ => return Ok(None),
+            };
+            cargo_cmd::capture(command, command_args, cwd, tracking, control)
+                .map(|captured| execution_from_capture(captured, "cargo"))
+                .map(Some)
+                .map_err(map_embedded_error)
+        }
+        _ if is_common_test_runner(words) => {
+            test_runner::capture_test(tool, args, cwd, tracking, control)
+                .map(|captured| execution_from_capture(captured, "test"))
+                .map(Some)
+                .map_err(map_embedded_error)
         }
         _ => Ok(None),
     }
+}
+
+fn execution_from_capture(captured: CapturedRun, tool: &'static str) -> ExecutionResult {
+    ExecutionResult {
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+        exit_code: captured.exit_code,
+        stdout_truncated: captured.stdout_truncated,
+        stderr_truncated: captured.stderr_truncated,
+        route: if captured.filtered {
+            ExecutionRoute::Filtered { tool }
+        } else {
+            ExecutionRoute::DirectPassthrough { tool }
+        },
+    }
+}
+
+fn is_common_test_runner(words: &[String]) -> bool {
+    let Some(tool) = words
+        .first()
+        .and_then(|tool| Path::new(tool).file_name().and_then(|name| name.to_str()))
+    else {
+        return false;
+    };
+    if matches!(
+        tool,
+        "pytest" | "jest" | "vitest" | "rspec" | "phpunit" | "pest"
+    ) {
+        return true;
+    }
+    let subcommand = words.get(1).map(String::as_str);
+    (tool == "go" && subcommand == Some("test"))
+        || (matches!(tool, "npm" | "pnpm" | "yarn") && subcommand == Some("test"))
 }
 
 fn has_file_operand(args: &[String]) -> bool {
@@ -424,6 +485,93 @@ mod tests {
 
         assert_eq!(result.stdout, "fallback");
         assert_eq!(result.route, ExecutionRoute::ShellPassthrough);
+    }
+
+    #[test]
+    fn filters_high_value_git_routes() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        run_in(temp.path(), "git", &["init", "-q"]);
+        run_in(
+            temp.path(),
+            "git",
+            &["config", "user.email", "rtk@example.com"],
+        );
+        run_in(temp.path(), "git", &["config", "user.name", "RTK Test"]);
+        fs::write(temp.path().join("file.txt"), "first\n").expect("write tracked file");
+        run_in(temp.path(), "git", &["add", "file.txt"]);
+        run_in(temp.path(), "git", &["commit", "-qm", "initial"]);
+        fs::write(temp.path().join("file.txt"), "first\nsecond\n").expect("modify file");
+        let options = ExecuteOptions::default().with_cwd(temp.path());
+
+        for command in ["git status", "git diff", "git log -1", "git show HEAD"] {
+            let result = execute_with_options(command, &options).expect("execute git route");
+            assert_eq!(result.exit_code, 0, "{command}: {}", result.stderr);
+            assert_eq!(
+                result.route,
+                ExecutionRoute::Filtered { tool: "git" },
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn filters_cargo_build_check_and_test_routes() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        fs::create_dir(temp.path().join("src")).expect("create src");
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname='embedded-route-test'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .expect("write manifest");
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 42 }\n#[test]\nfn works() { assert_eq!(answer(), 42); }\n",
+        )
+        .expect("write crate");
+        let options = ExecuteOptions::default().with_cwd(temp.path());
+
+        for command in ["cargo build", "cargo check", "cargo test"] {
+            let result = execute_with_options(command, &options).expect("execute cargo route");
+            assert_eq!(result.exit_code, 0, "{command}: {}", result.stderr);
+            assert_eq!(
+                result.route,
+                ExecutionRoute::Filtered { tool: "cargo" },
+                "{command}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filters_common_test_runner_route() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let runner = temp.path().join("pytest");
+        fs::write(
+            &runner,
+            "#!/bin/sh\nprintf '================ 2 passed in 0.01s ================\\n'\n",
+        )
+        .expect("write runner");
+        let mut permissions = fs::metadata(&runner)
+            .expect("runner metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&runner, permissions).expect("make runner executable");
+
+        let result = execute(runner.to_str().expect("utf8 path")).expect("execute test runner");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.route, ExecutionRoute::Filtered { tool: "test" });
+    }
+
+    fn run_in(cwd: &Path, program: &str, args: &[&str]) {
+        let status = Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .expect("start fixture command");
+        assert!(status.success(), "fixture command failed: {program}");
     }
 
     #[cfg(unix)]

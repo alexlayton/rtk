@@ -337,6 +337,32 @@ where
     )
 }
 
+/// Exit-aware variant of [`run_filtered_capture_controlled`].
+#[allow(dead_code)]
+pub fn run_filtered_capture_controlled_with_exit<F>(
+    cmd: Command,
+    tool_name: &str,
+    args_display: &str,
+    filter_fn: F,
+    opts: RunOptions<'_>,
+    track: bool,
+    control: &crate::core::process::ProcessControl,
+) -> Result<CapturedRun>
+where
+    F: Fn(&str, i32) -> String,
+{
+    let cmd_label = format!("{} {}", tool_name, args_display);
+    capture_filtered(
+        cmd,
+        tool_name,
+        &cmd_label,
+        filter_fn,
+        &opts,
+        track,
+        Some(control),
+    )
+}
+
 pub fn run_filtered<F>(
     cmd: Command,
     tool_name: &str,

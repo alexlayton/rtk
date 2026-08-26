@@ -4,6 +4,7 @@ use crate::core::stream::StreamFilter;
 use crate::core::truncate::{CAP_LIST, CAP_WARNINGS};
 use anyhow::Result;
 use regex::Regex;
+use std::path::Path;
 use std::process::Command;
 use std::sync::LazyLock;
 
@@ -142,6 +143,32 @@ pub fn run_test(command: &str, verbose: u8) -> Result<i32> {
         command,
         move |raw| extract_test_summary(raw, &command_owned),
         crate::core::runner::RunOptions::with_tee("test"),
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn capture_test(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    track: bool,
+    control: &crate::core::process::ProcessControl,
+) -> Result<crate::core::runner::CapturedRun> {
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(cwd);
+    let display = std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let filter_display = display.clone();
+    crate::core::runner::run_filtered_capture_controlled(
+        cmd,
+        "test",
+        &display,
+        move |raw| extract_test_summary(raw, &filter_display),
+        crate::core::runner::RunOptions::default(),
+        track,
+        control,
     )
 }
 

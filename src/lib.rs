@@ -4,12 +4,21 @@
 //! filtering without requiring an installed `rtk` executable.
 
 #[allow(dead_code)]
+#[path = "cmds/rust/cargo_cmd.rs"]
+mod cargo_cmd;
+#[allow(dead_code)]
 #[path = "library_core.rs"]
 mod core;
 mod execute;
 #[allow(dead_code)]
+#[path = "cmds/git/git.rs"]
+mod git_cmd;
+#[allow(dead_code)]
 #[path = "discover/lexer.rs"]
 mod shell_lexer;
+#[allow(dead_code)]
+#[path = "cmds/rust/runner.rs"]
+mod test_runner;
 #[allow(dead_code)]
 #[path = "cmds/system/wc_cmd.rs"]
 mod wc_cmd;
