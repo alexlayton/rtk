@@ -88,17 +88,30 @@ pub enum RunMode<'a> {
     Passthrough,
 }
 
-fn run_captured_filter<F>(
+/// Captured result of a command after RTK filtering.
+///
+/// Unlike the CLI runner, this value does not write to the embedding process's
+/// stdout or stderr and is therefore safe to return from the library API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedRun {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub filtered: bool,
+}
+
+fn capture_filtered<F>(
     mut cmd: Command,
     tool_name: &str,
     cmd_label: &str,
     filter_fn: F,
-    opts: RunOptions<'_>,
-    timer: tracking::TimedExecution,
-) -> Result<i32>
+    opts: &RunOptions<'_>,
+    track: bool,
+) -> Result<CapturedRun>
 where
     F: Fn(&str, i32) -> String,
 {
+    let timer = tracking::TimedExecution::start();
     let stdin_mode = if opts.inherit_stdin {
         StdinMode::Inherit
     } else {
@@ -112,14 +125,15 @@ where
     let raw_stdout = &result.raw_stdout;
 
     if opts.skip_filter_on_failure && exit_code != 0 {
-        if !result.raw_stdout.trim().is_empty() {
-            print!("{}", result.raw_stdout);
+        if track {
+            timer.track(cmd_label, &format!("rtk {}", cmd_label), raw, raw);
         }
-        if !result.raw_stderr.trim().is_empty() {
-            eprint!("{}", result.raw_stderr);
-        }
-        timer.track(cmd_label, &format!("rtk {}", cmd_label), raw, raw);
-        return Ok(exit_code);
+        return Ok(CapturedRun {
+            stdout: result.raw_stdout,
+            stderr: result.raw_stderr,
+            exit_code,
+            filtered: false,
+        });
     }
 
     let text_to_filter = if opts.filter_stdout_only {
@@ -136,24 +150,65 @@ where
     };
 
     let shown = if let Some(label) = opts.tee_label {
-        print_with_hint(&filtered, raw, raw_for_tracking, label, exit_code)
+        let hint = crate::core::tee::tee_and_hint(raw, label, exit_code);
+        let body = match hint {
+            Some(hint) => format!("{}\n{}", filtered, hint),
+            None => filtered,
+        };
+        crate::core::guard::never_worse(raw_for_tracking, &body).to_string()
     } else {
-        let guarded = crate::core::guard::never_worse(raw_for_tracking, &filtered).to_string();
-        if opts.no_trailing_newline {
-            print!("{}", guarded);
-        } else {
-            println!("{}", guarded);
-        }
-        guarded
+        crate::core::guard::never_worse(raw_for_tracking, &filtered).to_string()
     };
 
-    timer.track(
-        cmd_label,
-        &format!("rtk {}", cmd_label),
-        raw_for_tracking,
-        &shown,
-    );
-    Ok(exit_code)
+    if track {
+        timer.track(
+            cmd_label,
+            &format!("rtk {}", cmd_label),
+            raw_for_tracking,
+            &shown,
+        );
+    }
+    Ok(CapturedRun {
+        stdout: shown,
+        stderr: result.raw_stderr,
+        exit_code,
+        filtered: true,
+    })
+}
+
+fn print_captured(result: &CapturedRun, opts: &RunOptions<'_>) {
+    // Preserve the historical failure passthrough exactly: raw streams already
+    // contain their own line endings and empty stdout emits nothing.
+    if !result.filtered {
+        if !result.stdout.trim().is_empty() {
+            print!("{}", result.stdout);
+        }
+        if !result.stderr.trim().is_empty() {
+            eprint!("{}", result.stderr);
+        }
+        return;
+    }
+
+    if opts.no_trailing_newline {
+        print!("{}", result.stdout);
+    } else {
+        println!("{}", result.stdout);
+    }
+}
+
+fn run_captured_filter<F>(
+    cmd: Command,
+    tool_name: &str,
+    cmd_label: &str,
+    filter_fn: F,
+    opts: RunOptions<'_>,
+) -> Result<i32>
+where
+    F: Fn(&str, i32) -> String,
+{
+    let result = capture_filtered(cmd, tool_name, cmd_label, filter_fn, &opts, true)?;
+    print_captured(&result, &opts);
+    Ok(result.exit_code)
 }
 
 pub fn run(
@@ -173,7 +228,6 @@ pub fn run(
             &cmd_label,
             move |text, _| filter_fn(text),
             opts,
-            timer,
         ),
         RunMode::FilteredWithExit(filter_fn) => run_captured_filter(
             cmd,
@@ -181,7 +235,6 @@ pub fn run(
             &cmd_label,
             move |text, exit_code| filter_fn(text, exit_code),
             opts,
-            timer,
         ),
         RunMode::Streamed(filter) => {
             let result =
@@ -213,6 +266,36 @@ pub fn run(
             Ok(result.exit_code)
         }
     }
+}
+
+/// Execute and filter a command without writing to process-global output.
+///
+/// Tracking is opt-in for embedded callers so using RTK as a library does not
+/// unexpectedly create or modify the user's RTK history database.
+// The package currently compiles separate binary and library module graphs;
+// this entry point is used by the library graph while remaining unused in the
+// legacy binary graph until CLI dispatch moves behind the library boundary.
+#[allow(dead_code)]
+pub fn run_filtered_capture<F>(
+    cmd: Command,
+    tool_name: &str,
+    args_display: &str,
+    filter_fn: F,
+    opts: RunOptions<'_>,
+    track: bool,
+) -> Result<CapturedRun>
+where
+    F: Fn(&str) -> String,
+{
+    let cmd_label = format!("{} {}", tool_name, args_display);
+    capture_filtered(
+        cmd,
+        tool_name,
+        &cmd_label,
+        move |text, _| filter_fn(text),
+        &opts,
+        track,
+    )
 }
 
 pub fn run_filtered<F>(

@@ -1332,6 +1332,8 @@ pub fn estimate_tokens(text: &str) -> usize {
 ///
 /// ```no_run
 /// use rtk::tracking::TimedExecution;
+/// # fn execute_standard_command() -> anyhow::Result<String> { Ok(String::new()) }
+/// # fn execute_rtk_command() -> anyhow::Result<String> { Ok(String::new()) }
 ///
 /// let timer = TimedExecution::start();
 /// let input = execute_standard_command()?;

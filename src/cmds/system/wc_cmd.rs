@@ -6,15 +6,13 @@
 /// - `wc -w file.py`  → `96`
 /// - `wc -c file.py`  → `978`
 /// - `wc -l *.py`     → table with common path prefix stripped
-use crate::core::runner::{self, RunOptions};
+use crate::core::runner::{self, CapturedRun, RunOptions};
 use crate::core::utils::resolved_command;
 use anyhow::Result;
+use std::path::Path;
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
-    let mut cmd = resolved_command("wc");
-    for arg in args {
-        cmd.arg(arg);
-    }
+    let cmd = build_command(args);
 
     if verbose > 0 {
         eprintln!("Running: wc {}", args.join(" "));
@@ -38,6 +36,30 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         |stdout| filter_wc_output(stdout, &mode),
         opts,
     )
+}
+
+// Used by the library target's execution router; the legacy binary target
+// compiles this module separately and continues to call `run` above.
+#[allow(dead_code)]
+pub(crate) fn capture(args: &[String], cwd: &Path, track: bool) -> Result<CapturedRun> {
+    let mut cmd = build_command(args);
+    cmd.current_dir(cwd);
+    let mode = detect_mode(args);
+
+    runner::run_filtered_capture(
+        cmd,
+        "wc",
+        &args.join(" "),
+        |stdout| filter_wc_output(stdout, &mode),
+        RunOptions::stdout_only().early_exit_on_failure(),
+        track,
+    )
+}
+
+fn build_command(args: &[String]) -> std::process::Command {
+    let mut cmd = resolved_command("wc");
+    cmd.args(args);
+    cmd
 }
 
 /// Which columns the user requested
