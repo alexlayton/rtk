@@ -11,6 +11,29 @@ use crate::wc_cmd;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Runtime-neutral cancellation signal for an embedded command execution.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
 
 /// Options controlling an embedded command execution.
 #[derive(Debug, Clone, Default)]
@@ -23,6 +46,32 @@ pub struct ExecuteOptions {
     /// This defaults to false so embedding RTK has no unexpected persistence
     /// side effects.
     pub tracking: bool,
+    /// Maximum wall-clock duration for the complete execution.
+    pub timeout: Option<Duration>,
+    /// Optional signal that allows another thread to cancel the execution.
+    pub cancellation: Option<CancellationToken>,
+}
+
+impl ExecuteOptions {
+    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_tracking(mut self, tracking: bool) -> Self {
+        self.tracking = tracking;
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
 }
 
 /// How RTK handled a command.
@@ -180,10 +229,7 @@ mod tests {
     fn filters_plain_wc_command_without_printing() {
         let temp = tempfile::tempdir().expect("temporary directory");
         fs::write(temp.path().join("lines.txt"), "alpha\nbeta\n").expect("write fixture");
-        let options = ExecuteOptions {
-            cwd: Some(temp.path().to_path_buf()),
-            tracking: false,
-        };
+        let options = ExecuteOptions::default().with_cwd(temp.path());
 
         let result = execute_with_options("wc -l lines.txt", &options).expect("execute wc");
 
@@ -196,10 +242,7 @@ mod tests {
     #[test]
     fn failed_filtered_command_returns_raw_failure_without_exiting() {
         let temp = tempfile::tempdir().expect("temporary directory");
-        let options = ExecuteOptions {
-            cwd: Some(temp.path().to_path_buf()),
-            tracking: false,
-        };
+        let options = ExecuteOptions::default().with_cwd(temp.path());
 
         let result =
             execute_with_options("wc -l missing.txt", &options).expect("execute failing wc");

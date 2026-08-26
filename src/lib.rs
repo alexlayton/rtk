@@ -15,4 +15,7 @@ mod shell_lexer;
 mod wc_cmd;
 
 pub use core::{tracking, utils};
-pub use execute::{execute, execute_with_options, ExecuteOptions, ExecutionResult, ExecutionRoute};
+pub use execute::{
+    execute, execute_with_options, CancellationToken, ExecuteOptions, ExecutionResult,
+    ExecutionRoute,
+};
