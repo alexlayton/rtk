@@ -93,6 +93,7 @@ pub struct ProcessOutput {
 pub enum ProcessError {
     Interrupted {
         reason: Interruption,
+        started: bool,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
         stdout_truncated: bool,
@@ -172,6 +173,7 @@ pub fn capture_command(
     if let Some(reason) = control.interruption() {
         return Err(ProcessError::Interrupted {
             reason,
+            started: false,
             stdout: Vec::new(),
             stderr: Vec::new(),
             stdout_truncated: false,
@@ -235,6 +237,7 @@ pub fn capture_command(
             guard.disarm();
             return Err(ProcessError::Interrupted {
                 reason,
+                started: true,
                 stdout: stdout.bytes,
                 stderr: stderr.bytes,
                 stdout_truncated: stdout.truncated,

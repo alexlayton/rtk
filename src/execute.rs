@@ -5,12 +5,13 @@
 //! and shell syntax are executed unchanged by the platform shell.
 
 pub use crate::core::process::CancellationToken;
-use crate::core::process::{capture_command, ProcessControl};
+use crate::core::process::{capture_command, Interruption, ProcessControl, ProcessError};
 use crate::core::stream::status_to_exit_code;
 use crate::core::utils::decode_process_output;
 use crate::shell_lexer::{self, TokenKind};
 use crate::wc_cmd;
-use anyhow::{Context, Result};
+use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -76,6 +77,90 @@ impl ExecuteOptions {
     }
 }
 
+#[derive(Debug)]
+pub enum BeforeStartError {
+    Cancelled,
+    TimedOut,
+    WorkingDirectory(io::Error),
+}
+
+#[derive(Debug)]
+pub enum MayHaveStartedKind {
+    Cancelled,
+    TimedOut,
+    Spawn(io::Error),
+    Wait(io::Error),
+    Terminate(io::Error),
+    Capture(io::Error),
+    Filter(String),
+}
+
+#[derive(Debug, Default)]
+pub struct PartialOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+#[derive(Debug)]
+pub struct MayHaveStartedError {
+    pub kind: MayHaveStartedKind,
+    pub partial_output: PartialOutput,
+}
+
+/// Execution failure classified by whether retrying could repeat side effects.
+#[derive(Debug)]
+pub enum ExecuteError {
+    BeforeStart(BeforeStartError),
+    MayHaveStarted(MayHaveStartedError),
+}
+
+impl ExecuteError {
+    pub fn may_have_started(&self) -> bool {
+        matches!(self, Self::MayHaveStarted(_))
+    }
+}
+
+impl fmt::Display for ExecuteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforeStart(error) => write!(formatter, "command did not start: {error}"),
+            Self::MayHaveStarted(error) => write!(formatter, "command may have started: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ExecuteError {}
+
+impl fmt::Display for BeforeStartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("execution was cancelled"),
+            Self::TimedOut => formatter.write_str("execution timed out"),
+            Self::WorkingDirectory(error) => {
+                write!(formatter, "failed to determine working directory: {error}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for MayHaveStartedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            MayHaveStartedKind::Cancelled => formatter.write_str("execution was cancelled"),
+            MayHaveStartedKind::TimedOut => formatter.write_str("execution timed out"),
+            MayHaveStartedKind::Spawn(error) => write!(formatter, "spawn failed: {error}"),
+            MayHaveStartedKind::Wait(error) => write!(formatter, "wait failed: {error}"),
+            MayHaveStartedKind::Terminate(error) => {
+                write!(formatter, "process-tree termination failed: {error}")
+            }
+            MayHaveStartedKind::Capture(error) => write!(formatter, "capture failed: {error}"),
+            MayHaveStartedKind::Filter(error) => write!(formatter, "filter failed: {error}"),
+        }
+    }
+}
+
 /// How RTK handled a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionRoute {
@@ -115,15 +200,20 @@ impl ExecutionResult {
 /// Unsupported commands and complex shell syntax are passed to the platform
 /// shell unchanged. The function captures output and never prints or exits the
 /// embedding process.
-pub fn execute(command: &str) -> Result<ExecutionResult> {
+pub fn execute(command: &str) -> Result<ExecutionResult, ExecuteError> {
     execute_with_options(command, &ExecuteOptions::default())
 }
 
 /// Execute a shell command with explicit embedding options.
-pub fn execute_with_options(command: &str, options: &ExecuteOptions) -> Result<ExecutionResult> {
+pub fn execute_with_options(
+    command: &str,
+    options: &ExecuteOptions,
+) -> Result<ExecutionResult, ExecuteError> {
     let cwd = match &options.cwd {
         Some(cwd) => cwd.clone(),
-        None => std::env::current_dir().context("Failed to determine command working directory")?,
+        None => std::env::current_dir()
+            .map_err(BeforeStartError::WorkingDirectory)
+            .map_err(ExecuteError::BeforeStart)?,
     };
 
     let control = ProcessControl::new(
@@ -145,7 +235,7 @@ fn execute_filtered(
     cwd: &Path,
     tracking: bool,
     control: &ProcessControl,
-) -> Result<Option<ExecutionResult>> {
+) -> Result<Option<ExecutionResult>, ExecuteError> {
     let Some((tool, args)) = words.split_first() else {
         return Ok(None);
     };
@@ -154,8 +244,8 @@ fn execute_filtered(
         // A bare `wc` reads stdin. The embedded API does not accept stdin yet,
         // so leave that case to the shell executor, whose stdin is null.
         "wc" if has_file_operand(args) => {
-            let captured = wc_cmd::capture(args, cwd, tracking, control)
-                .context("Failed to execute filtered wc command")?;
+            let captured =
+                wc_cmd::capture(args, cwd, tracking, control).map_err(map_embedded_error)?;
             Ok(Some(ExecutionResult {
                 stdout: captured.stdout,
                 stderr: captured.stderr,
@@ -208,7 +298,11 @@ fn plain_words(command: &str) -> Option<Vec<String>> {
     Some(tokens.into_iter().map(|token| token.value).collect())
 }
 
-fn execute_shell(command: &str, cwd: &Path, control: &ProcessControl) -> Result<ExecutionResult> {
+fn execute_shell(
+    command: &str,
+    cwd: &Path,
+    control: &ProcessControl,
+) -> Result<ExecutionResult, ExecuteError> {
     #[cfg(windows)]
     let (shell, flag) = ("cmd", "/C");
     #[cfg(not(windows))]
@@ -216,9 +310,7 @@ fn execute_shell(command: &str, cwd: &Path, control: &ProcessControl) -> Result<
 
     let mut shell_command = Command::new(shell);
     shell_command.arg(flag).arg(command).current_dir(cwd);
-    let output = capture_command(&mut shell_command, control)
-        .map_err(anyhow::Error::new)
-        .with_context(|| format!("Failed to execute command through {shell}"))?;
+    let output = capture_command(&mut shell_command, control).map_err(map_process_error)?;
 
     Ok(ExecutionResult {
         stdout: decode_process_output(&output.stdout),
@@ -227,6 +319,57 @@ fn execute_shell(command: &str, cwd: &Path, control: &ProcessControl) -> Result<
         route: ExecutionRoute::ShellPassthrough,
         stdout_truncated: output.stdout_truncated,
         stderr_truncated: output.stderr_truncated,
+    })
+}
+
+fn map_embedded_error(error: anyhow::Error) -> ExecuteError {
+    match error.downcast::<ProcessError>() {
+        Ok(error) => map_process_error(error),
+        Err(error) => may_have_started(MayHaveStartedKind::Filter(format!("{error:#}"))),
+    }
+}
+
+fn map_process_error(error: ProcessError) -> ExecuteError {
+    match error {
+        ProcessError::Interrupted {
+            reason,
+            started,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        } => {
+            let kind = match reason {
+                Interruption::Cancelled => MayHaveStartedKind::Cancelled,
+                Interruption::TimedOut => MayHaveStartedKind::TimedOut,
+            };
+            if !started {
+                return ExecuteError::BeforeStart(match reason {
+                    Interruption::Cancelled => BeforeStartError::Cancelled,
+                    Interruption::TimedOut => BeforeStartError::TimedOut,
+                });
+            }
+            ExecuteError::MayHaveStarted(MayHaveStartedError {
+                kind,
+                partial_output: PartialOutput {
+                    stdout: decode_process_output(&stdout),
+                    stderr: decode_process_output(&stderr),
+                    stdout_truncated,
+                    stderr_truncated,
+                },
+            })
+        }
+        ProcessError::Spawn(error) => may_have_started(MayHaveStartedKind::Spawn(error)),
+        ProcessError::Wait(error) => may_have_started(MayHaveStartedKind::Wait(error)),
+        ProcessError::Terminate(error) => may_have_started(MayHaveStartedKind::Terminate(error)),
+        ProcessError::Read(error) => may_have_started(MayHaveStartedKind::Capture(error)),
+    }
+}
+
+fn may_have_started(kind: MayHaveStartedKind) -> ExecuteError {
+    ExecuteError::MayHaveStarted(MayHaveStartedError {
+        kind,
+        partial_output: PartialOutput::default(),
     })
 }
 
@@ -306,7 +449,13 @@ mod tests {
 
         let error = execute_with_options(command, &options).expect_err("command should time out");
 
-        assert!(format!("{error:#}").contains("timed out"));
+        assert!(matches!(
+            error,
+            ExecuteError::MayHaveStarted(MayHaveStartedError {
+                kind: MayHaveStartedKind::TimedOut,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -326,7 +475,44 @@ mod tests {
             .expect("execution thread")
             .expect_err("command should be cancelled");
 
-        assert!(format!("{error:#}").contains("cancelled"));
+        assert!(matches!(
+            error,
+            ExecuteError::MayHaveStarted(MayHaveStartedError {
+                kind: MayHaveStartedKind::Cancelled,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cancellation_before_spawn_is_safe_to_retry() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let options = ExecuteOptions::default().with_cancellation(cancellation);
+
+        let error = execute_with_options("printf should-not-run", &options)
+            .expect_err("pre-cancelled command");
+
+        assert!(matches!(
+            &error,
+            ExecuteError::BeforeStart(BeforeStartError::Cancelled)
+        ));
+        assert!(!error.may_have_started());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interruption_returns_partial_output_without_retrying() {
+        let options = ExecuteOptions::default().with_timeout(Duration::from_millis(50));
+
+        let error = execute_with_options("printf started; sleep 5", &options)
+            .expect_err("command should time out");
+
+        let ExecuteError::MayHaveStarted(error) = error else {
+            panic!("timeout after output must be classified as may-have-started");
+        };
+        assert!(matches!(error.kind, MayHaveStartedKind::TimedOut));
+        assert_eq!(error.partial_output.stdout, "started");
     }
 
     #[cfg(unix)]
@@ -339,7 +525,13 @@ mod tests {
         let command = "sh -c 'sleep 30 & echo $! > child.pid; wait'";
 
         let error = execute_with_options(command, &options).expect_err("command should time out");
-        assert!(format!("{error:#}").contains("timed out"));
+        assert!(matches!(
+            error,
+            ExecuteError::MayHaveStarted(MayHaveStartedError {
+                kind: MayHaveStartedKind::TimedOut,
+                ..
+            })
+        ));
         let pid = fs::read_to_string(temp.path().join("child.pid"))
             .expect("child pid file")
             .trim()

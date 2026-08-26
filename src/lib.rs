@@ -16,6 +16,7 @@ mod wc_cmd;
 
 pub use core::{tracking, utils};
 pub use execute::{
-    execute, execute_with_options, CancellationToken, ExecuteOptions, ExecutionResult,
-    ExecutionRoute, DEFAULT_OUTPUT_LIMIT,
+    execute, execute_with_options, BeforeStartError, CancellationToken, ExecuteError,
+    ExecuteOptions, ExecutionResult, ExecutionRoute, MayHaveStartedError, MayHaveStartedKind,
+    PartialOutput, DEFAULT_OUTPUT_LIMIT,
 };
