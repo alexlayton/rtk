@@ -35,14 +35,20 @@ impl CancellationToken {
 pub struct ProcessControl {
     deadline: Option<Instant>,
     cancellation: Option<CancellationToken>,
+    output_limit: usize,
 }
 
 impl ProcessControl {
-    pub fn new(timeout: Option<Duration>, cancellation: Option<CancellationToken>) -> Self {
+    pub fn new(
+        timeout: Option<Duration>,
+        cancellation: Option<CancellationToken>,
+        output_limit: usize,
+    ) -> Self {
         let started = Instant::now();
         Self {
             deadline: timeout.and_then(|duration| started.checked_add(duration)),
             cancellation,
+            output_limit,
         }
     }
 
@@ -78,6 +84,8 @@ pub enum Interruption {
 pub struct ProcessOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
     pub status: ExitStatus,
 }
 
@@ -87,6 +95,8 @@ pub enum ProcessError {
         reason: Interruption,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
     },
     Spawn(io::Error),
     Wait(io::Error),
@@ -164,6 +174,8 @@ pub fn capture_command(
             reason,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
         });
     }
 
@@ -186,8 +198,8 @@ pub fn capture_command(
         .stderr
         .take()
         .ok_or_else(|| ProcessError::Read(io::Error::other("missing child stderr pipe")))?;
-    let stdout_reader = spawn_reader(stdout);
-    let stderr_reader = spawn_reader(stderr);
+    let stdout_reader = spawn_reader(stdout, control.output_limit);
+    let stderr_reader = spawn_reader(stderr, control.output_limit);
 
     loop {
         let status = guard.child().try_wait().map_err(ProcessError::Wait)?;
@@ -195,8 +207,10 @@ pub fn capture_command(
             let (stdout, stderr) = collect_output(stdout_reader, stderr_reader)?;
             guard.disarm();
             return Ok(ProcessOutput {
-                stdout,
-                stderr,
+                stdout: stdout.bytes,
+                stderr: stderr.bytes,
+                stdout_truncated: stdout.truncated,
+                stderr_truncated: stderr.truncated,
                 status,
             });
         }
@@ -207,8 +221,10 @@ pub fn capture_command(
                 let (stdout, stderr) = collect_output(stdout_reader, stderr_reader)?;
                 guard.disarm();
                 return Ok(ProcessOutput {
-                    stdout,
-                    stderr,
+                    stdout: stdout.bytes,
+                    stderr: stderr.bytes,
+                    stdout_truncated: stdout.truncated,
+                    stderr_truncated: stderr.truncated,
                     status,
                 });
             }
@@ -219,8 +235,10 @@ pub fn capture_command(
             guard.disarm();
             return Err(ProcessError::Interrupted {
                 reason,
-                stdout,
-                stderr,
+                stdout: stdout.bytes,
+                stderr: stderr.bytes,
+                stdout_truncated: stdout.truncated,
+                stderr_truncated: stderr.truncated,
             });
         }
 
@@ -228,18 +246,37 @@ pub fn capture_command(
     }
 }
 
-fn spawn_reader(mut reader: impl Read + Send + 'static) -> JoinHandle<io::Result<Vec<u8>>> {
+struct CapturedStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn spawn_reader(
+    mut reader: impl Read + Send + 'static,
+    limit: usize,
+) -> JoinHandle<io::Result<CapturedStream>> {
     thread::spawn(move || {
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output)?;
-        Ok(output)
+        let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+        let mut buffer = [0_u8; 8 * 1024];
+        let mut truncated = false;
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let available = limit.saturating_sub(bytes.len());
+            let retained = read.min(available);
+            bytes.extend_from_slice(&buffer[..retained]);
+            truncated |= retained < read;
+        }
+        Ok(CapturedStream { bytes, truncated })
     })
 }
 
 fn collect_output(
-    stdout_reader: JoinHandle<io::Result<Vec<u8>>>,
-    stderr_reader: JoinHandle<io::Result<Vec<u8>>>,
-) -> Result<(Vec<u8>, Vec<u8>), ProcessError> {
+    stdout_reader: JoinHandle<io::Result<CapturedStream>>,
+    stderr_reader: JoinHandle<io::Result<CapturedStream>>,
+) -> Result<(CapturedStream, CapturedStream), ProcessError> {
     let stdout = stdout_reader
         .join()
         .map_err(|_| ProcessError::Read(io::Error::other("stdout reader thread panicked")))?

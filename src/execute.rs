@@ -15,8 +15,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+pub const DEFAULT_OUTPUT_LIMIT: usize = 10 * 1024 * 1024;
+
 /// Options controlling an embedded command execution.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ExecuteOptions {
     /// Directory in which the child command runs. The process's current
     /// directory is used when this is not set.
@@ -30,6 +32,21 @@ pub struct ExecuteOptions {
     pub timeout: Option<Duration>,
     /// Optional signal that allows another thread to cancel the execution.
     pub cancellation: Option<CancellationToken>,
+    /// Maximum bytes retained independently for stdout and stderr. Additional
+    /// bytes are drained and discarded so children cannot block on full pipes.
+    pub output_limit: usize,
+}
+
+impl Default for ExecuteOptions {
+    fn default() -> Self {
+        Self {
+            cwd: None,
+            tracking: false,
+            timeout: None,
+            cancellation: None,
+            output_limit: DEFAULT_OUTPUT_LIMIT,
+        }
+    }
 }
 
 impl ExecuteOptions {
@@ -50,6 +67,11 @@ impl ExecuteOptions {
 
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = Some(cancellation);
+        self
+    }
+
+    pub fn with_output_limit(mut self, output_limit: usize) -> Self {
+        self.output_limit = output_limit;
         self
     }
 }
@@ -73,6 +95,8 @@ pub struct ExecutionResult {
     pub stderr: String,
     pub exit_code: i32,
     pub route: ExecutionRoute,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 impl ExecutionResult {
@@ -102,7 +126,11 @@ pub fn execute_with_options(command: &str, options: &ExecuteOptions) -> Result<E
         None => std::env::current_dir().context("Failed to determine command working directory")?,
     };
 
-    let control = ProcessControl::new(options.timeout, options.cancellation.clone());
+    let control = ProcessControl::new(
+        options.timeout,
+        options.cancellation.clone(),
+        options.output_limit,
+    );
     if let Some(words) = plain_words(command) {
         if let Some(result) = execute_filtered(&words, &cwd, options.tracking, &control)? {
             return Ok(result);
@@ -132,6 +160,8 @@ fn execute_filtered(
                 stdout: captured.stdout,
                 stderr: captured.stderr,
                 exit_code: captured.exit_code,
+                stdout_truncated: captured.stdout_truncated,
+                stderr_truncated: captured.stderr_truncated,
                 route: if captured.filtered {
                     ExecutionRoute::Filtered { tool: "wc" }
                 } else {
@@ -195,6 +225,8 @@ fn execute_shell(command: &str, cwd: &Path, control: &ProcessControl) -> Result<
         stderr: decode_process_output(&output.stderr),
         exit_code: status_to_exit_code(output.status),
         route: ExecutionRoute::ShellPassthrough,
+        stdout_truncated: output.stdout_truncated,
+        stderr_truncated: output.stderr_truncated,
     })
 }
 
@@ -249,6 +281,19 @@ mod tests {
 
         assert_eq!(result.stdout, "fallback");
         assert_eq!(result.route, ExecutionRoute::ShellPassthrough);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_discards_output_beyond_configured_limit() {
+        let options = ExecuteOptions::default().with_output_limit(256);
+
+        let result = execute_with_options("yes 1234567890 | head -c 4096", &options)
+            .expect("execute large-output command");
+
+        assert_eq!(result.stdout.len(), 256);
+        assert!(result.stdout_truncated);
+        assert!(!result.stderr_truncated);
     }
 
     #[test]

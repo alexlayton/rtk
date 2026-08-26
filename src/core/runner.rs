@@ -98,6 +98,8 @@ pub struct CapturedRun {
     pub stderr: String,
     pub exit_code: i32,
     pub filtered: bool,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 fn capture_filtered<F>(
@@ -139,6 +141,8 @@ where
             stderr: result.raw_stderr,
             exit_code,
             filtered: false,
+            stdout_truncated: result.stdout_truncated,
+            stderr_truncated: result.stderr_truncated,
         });
     }
 
@@ -179,6 +183,8 @@ where
         stderr: result.raw_stderr,
         exit_code,
         filtered: true,
+        stdout_truncated: result.stdout_truncated,
+        stderr_truncated: result.stderr_truncated,
     })
 }
 

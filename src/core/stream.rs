@@ -250,6 +250,8 @@ pub struct StreamResult {
     pub raw_stdout: String,
     pub raw_stderr: String,
     pub filtered: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 impl StreamResult {
@@ -290,6 +292,8 @@ pub fn run_capture_controlled(
         filtered: raw_stdout.clone(),
         raw_stdout,
         raw_stderr,
+        stdout_truncated: output.stdout_truncated,
+        stderr_truncated: output.stderr_truncated,
     })
 }
 
@@ -316,6 +320,8 @@ pub fn run_streaming(
             raw_stdout: String::new(),
             raw_stderr: String::new(),
             filtered: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
         });
     }
 
@@ -558,6 +564,8 @@ pub fn run_streaming(
         raw_stdout,
         raw_stderr,
         filtered,
+        stdout_truncated: capped_out,
+        stderr_truncated: capped_err,
     })
 }
 
@@ -776,6 +784,8 @@ pub(crate) mod tests {
             raw_stdout: String::new(),
             raw_stderr: String::new(),
             filtered: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
         };
         assert!(r.success());
     }
@@ -788,6 +798,8 @@ pub(crate) mod tests {
             raw_stdout: String::new(),
             raw_stderr: String::new(),
             filtered: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
         };
         assert!(!r.success());
     }
@@ -800,6 +812,8 @@ pub(crate) mod tests {
             raw_stdout: String::new(),
             raw_stderr: String::new(),
             filtered: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
         };
         assert!(!r.success());
     }
