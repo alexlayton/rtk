@@ -164,6 +164,26 @@ impl fmt::Display for MayHaveStartedError {
     }
 }
 
+#[derive(Debug, Clone)]
+enum FilterRoute {
+    Wc,
+    Git(GitCommand),
+    Cargo(CargoCommand),
+    Test,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChainOperator {
+    And,
+    Or,
+    Sequence,
+}
+
+struct DirectPlan {
+    commands: Vec<Vec<String>>,
+    operators: Vec<ChainOperator>,
+}
+
 /// How RTK handled a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionRoute {
@@ -224,70 +244,188 @@ pub fn execute_with_options(
         options.cancellation.clone(),
         options.output_limit,
     );
-    if let Some(words) = plain_words(command) {
-        if let Some(result) = execute_filtered(&words, &cwd, options.tracking, &control)? {
-            return Ok(result);
+    if let Some(plan) = parse_direct_plan(command) {
+        let routes = plan
+            .commands
+            .iter()
+            .map(|words| classify_filtered_route(words))
+            .collect::<Option<Vec<_>>>();
+        if let Some(routes) = routes {
+            return execute_direct_plan(plan, routes, &cwd, options.tracking, &control);
         }
     }
 
     execute_shell(command, &cwd, &control)
 }
 
+fn classify_filtered_route(words: &[String]) -> Option<FilterRoute> {
+    let (tool, args) = words.split_first()?;
+    match tool.as_str() {
+        "wc" if has_file_operand(args) => Some(FilterRoute::Wc),
+        "git" => match args.first().map(String::as_str) {
+            Some("status") => Some(FilterRoute::Git(GitCommand::Status)),
+            Some("diff") => Some(FilterRoute::Git(GitCommand::Diff)),
+            Some("log") => Some(FilterRoute::Git(GitCommand::Log)),
+            Some("show") => Some(FilterRoute::Git(GitCommand::Show)),
+            _ => None,
+        },
+        "cargo" => match args.first().map(String::as_str) {
+            Some("build") => Some(FilterRoute::Cargo(CargoCommand::Build)),
+            Some("check") => Some(FilterRoute::Cargo(CargoCommand::Check)),
+            Some("test") => Some(FilterRoute::Cargo(CargoCommand::Test)),
+            _ => None,
+        },
+        _ if is_common_test_runner(words) => Some(FilterRoute::Test),
+        _ => None,
+    }
+}
+
+fn execute_direct_plan(
+    plan: DirectPlan,
+    routes: Vec<FilterRoute>,
+    cwd: &Path,
+    tracking: bool,
+    control: &ProcessControl,
+) -> Result<ExecutionResult, ExecuteError> {
+    if plan.commands.len() == 1 {
+        return execute_filtered(routes[0].clone(), &plan.commands[0], cwd, tracking, control);
+    }
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit_code = 0;
+    let mut executed_any = false;
+    let mut all_filtered = true;
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
+
+    for (index, (words, route)) in plan.commands.iter().zip(routes).enumerate() {
+        if index > 0 && !should_run(plan.operators[index - 1], exit_code) {
+            continue;
+        }
+
+        let result = match execute_filtered(route, words, cwd, tracking, control) {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(enrich_chain_error(
+                    error,
+                    executed_any,
+                    stdout,
+                    stderr,
+                    stdout_truncated,
+                    stderr_truncated,
+                ));
+            }
+        };
+        append_chain_output(&mut stdout, &result.stdout);
+        append_chain_output(&mut stderr, &result.stderr);
+        exit_code = result.exit_code;
+        executed_any = true;
+        all_filtered &= result.filtered();
+        stdout_truncated |= result.stdout_truncated;
+        stderr_truncated |= result.stderr_truncated;
+    }
+
+    Ok(ExecutionResult {
+        stdout,
+        stderr,
+        exit_code,
+        route: if all_filtered {
+            ExecutionRoute::Filtered { tool: "chain" }
+        } else {
+            ExecutionRoute::DirectPassthrough { tool: "chain" }
+        },
+        stdout_truncated,
+        stderr_truncated,
+    })
+}
+
+fn should_run(operator: ChainOperator, previous_exit_code: i32) -> bool {
+    match operator {
+        ChainOperator::And => previous_exit_code == 0,
+        ChainOperator::Or => previous_exit_code != 0,
+        ChainOperator::Sequence => true,
+    }
+}
+
+fn append_chain_output(output: &mut String, next: &str) {
+    if next.is_empty() {
+        return;
+    }
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(next);
+}
+
+fn enrich_chain_error(
+    error: ExecuteError,
+    executed_any: bool,
+    stdout: String,
+    stderr: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) -> ExecuteError {
+    if !executed_any {
+        return error;
+    }
+
+    let mut error = match error {
+        ExecuteError::BeforeStart(error) => MayHaveStartedError {
+            kind: match error {
+                BeforeStartError::Cancelled => MayHaveStartedKind::Cancelled,
+                BeforeStartError::TimedOut => MayHaveStartedKind::TimedOut,
+                BeforeStartError::WorkingDirectory(error) => {
+                    MayHaveStartedKind::Filter(error.to_string())
+                }
+            },
+            partial_output: PartialOutput::default(),
+        },
+        ExecuteError::MayHaveStarted(error) => error,
+    };
+    let mut combined_stdout = stdout;
+    let mut combined_stderr = stderr;
+    append_chain_output(&mut combined_stdout, &error.partial_output.stdout);
+    append_chain_output(&mut combined_stderr, &error.partial_output.stderr);
+    error.partial_output.stdout = combined_stdout;
+    error.partial_output.stderr = combined_stderr;
+    error.partial_output.stdout_truncated |= stdout_truncated;
+    error.partial_output.stderr_truncated |= stderr_truncated;
+    ExecuteError::MayHaveStarted(error)
+}
+
 fn execute_filtered(
+    route: FilterRoute,
     words: &[String],
     cwd: &Path,
     tracking: bool,
     control: &ProcessControl,
-) -> Result<Option<ExecutionResult>, ExecuteError> {
-    let Some((tool, args)) = words.split_first() else {
-        return Ok(None);
-    };
+) -> Result<ExecutionResult, ExecuteError> {
+    let (tool, args) = words
+        .split_first()
+        .expect("preflight rejects empty direct commands");
 
-    match tool.as_str() {
+    match route {
         // A bare `wc` reads stdin. The embedded API does not accept stdin yet,
         // so leave that case to the shell executor, whose stdin is null.
-        "wc" if has_file_operand(args) => wc_cmd::capture(args, cwd, tracking, control)
+        FilterRoute::Wc => wc_cmd::capture(args, cwd, tracking, control)
             .map(|captured| execution_from_capture(captured, "wc"))
-            .map(Some)
             .map_err(map_embedded_error),
-        "git" => {
-            let Some((subcommand, command_args)) = args.split_first() else {
-                return Ok(None);
-            };
-            let command = match subcommand.as_str() {
-                "status" => GitCommand::Status,
-                "diff" => GitCommand::Diff,
-                "log" => GitCommand::Log,
-                "show" => GitCommand::Show,
-                _ => return Ok(None),
-            };
+        FilterRoute::Git(command) => {
+            let command_args = &args[1..];
             git_cmd::capture(command, command_args, cwd, tracking, control)
                 .map(|captured| execution_from_capture(captured, "git"))
-                .map(Some)
                 .map_err(map_embedded_error)
         }
-        "cargo" => {
-            let Some((subcommand, command_args)) = args.split_first() else {
-                return Ok(None);
-            };
-            let command = match subcommand.as_str() {
-                "build" => CargoCommand::Build,
-                "check" => CargoCommand::Check,
-                "test" => CargoCommand::Test,
-                _ => return Ok(None),
-            };
+        FilterRoute::Cargo(command) => {
+            let command_args = &args[1..];
             cargo_cmd::capture(command, command_args, cwd, tracking, control)
                 .map(|captured| execution_from_capture(captured, "cargo"))
-                .map(Some)
                 .map_err(map_embedded_error)
         }
-        _ if is_common_test_runner(words) => {
-            test_runner::capture_test(tool, args, cwd, tracking, control)
-                .map(|captured| execution_from_capture(captured, "test"))
-                .map(Some)
-                .map_err(map_embedded_error)
-        }
-        _ => Ok(None),
+        FilterRoute::Test => test_runner::capture_test(tool, args, cwd, tracking, control)
+            .map(|captured| execution_from_capture(captured, "test"))
+            .map_err(map_embedded_error),
     }
 }
 
@@ -338,25 +476,58 @@ fn has_file_operand(args: &[String]) -> bool {
     })
 }
 
-/// Return words only for syntax whose argv can be reconstructed without a
-/// shell. Quoting and escaping are intentionally rejected in this first API
-/// slice; false negatives merely use the behavior-preserving shell fallback.
-fn plain_words(command: &str) -> Option<Vec<String>> {
+/// Parse only literal argv joined by `&&`, `||`, or `;`. Any syntax requiring
+/// shell expansion rejects the complete plan so the untouched command can run
+/// exactly once through the platform shell.
+fn parse_direct_plan(command: &str) -> Option<DirectPlan> {
     let trimmed = command.trim();
     if trimmed.is_empty()
-        || trimmed
-            .chars()
-            .any(|character| matches!(character, '\'' | '"' | '\\' | '\n' | '\r'))
+        || trimmed.chars().any(|character| {
+            matches!(
+                character,
+                '\'' | '"' | '\\' | '\n' | '\r' | '\0' | '$' | '#' | '[' | ']'
+            )
+        })
     {
         return None;
     }
 
-    let tokens = shell_lexer::tokenize(trimmed);
-    if tokens.is_empty() || tokens.iter().any(|token| token.kind != TokenKind::Arg) {
-        return None;
+    let mut commands = Vec::new();
+    let mut operators = Vec::new();
+    let mut words = Vec::new();
+    for token in shell_lexer::tokenize(trimmed) {
+        match token.kind {
+            TokenKind::Arg if !token.value.starts_with('~') => words.push(token.value),
+            TokenKind::Operator => {
+                if words.is_empty() {
+                    return None;
+                }
+                let operator = match token.value.as_str() {
+                    "&&" => ChainOperator::And,
+                    "||" => ChainOperator::Or,
+                    ";" => ChainOperator::Sequence,
+                    _ => return None,
+                };
+                commands.push(std::mem::take(&mut words));
+                operators.push(operator);
+            }
+            _ => return None,
+        }
     }
 
-    Some(tokens.into_iter().map(|token| token.value).collect())
+    if words.is_empty() {
+        if matches!(operators.last(), Some(ChainOperator::Sequence)) {
+            operators.pop();
+        } else {
+            return None;
+        }
+    } else {
+        commands.push(words);
+    }
+    (!commands.is_empty() && operators.len() + 1 == commands.len()).then_some(DirectPlan {
+        commands,
+        operators,
+    })
 }
 
 fn execute_shell(
@@ -477,6 +648,64 @@ mod tests {
         assert!(result.stderr.is_empty());
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.route, ExecutionRoute::ShellPassthrough);
+    }
+
+    #[test]
+    fn safe_chains_preserve_and_or_sequence_semantics() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        fs::write(temp.path().join("one.txt"), "one\n").expect("write one");
+        fs::write(temp.path().join("two.txt"), "one\ntwo\n").expect("write two");
+        let options = ExecuteOptions::default().with_cwd(temp.path());
+
+        let and_result = execute_with_options("wc -l one.txt && wc -l two.txt", &options)
+            .expect("execute and chain");
+        assert_eq!(and_result.stdout, "1\n2");
+        assert_eq!(and_result.exit_code, 0);
+        assert_eq!(and_result.route, ExecutionRoute::Filtered { tool: "chain" });
+
+        let or_result = execute_with_options("wc -l missing.txt || wc -l two.txt", &options)
+            .expect("execute or chain");
+        assert_eq!(or_result.stdout, "2");
+        assert_eq!(or_result.exit_code, 0);
+        assert!(or_result.stderr.contains("missing.txt"));
+
+        let sequence_result = execute_with_options("wc -l one.txt;wc -l two.txt", &options)
+            .expect("execute sequence chain");
+        assert_eq!(sequence_result.stdout, "1\n2");
+        assert_eq!(sequence_result.exit_code, 0);
+    }
+
+    #[test]
+    fn unsupported_chain_is_preflighted_and_executed_once_by_shell() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        fs::write(temp.path().join("one.txt"), "one\n").expect("write one");
+        let options = ExecuteOptions::default().with_cwd(temp.path());
+
+        let result =
+            execute_with_options("wc -l one.txt && printf fallback > marker.txt", &options)
+                .expect("execute shell fallback");
+
+        assert_eq!(result.route, ExecutionRoute::ShellPassthrough);
+        assert!(result.stdout.contains("one.txt"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("marker.txt")).expect("marker"),
+            "fallback"
+        );
+    }
+
+    #[test]
+    fn complex_or_expanding_syntax_is_not_directly_planned() {
+        for command in [
+            "wc -l file | cat",
+            "wc -l file > count",
+            "wc -l $FILE",
+            "wc -l *.txt",
+            "echo $(wc -l file)",
+            "for file in *.txt; do wc -l $file; done",
+            "wc -l 'file name' && wc -l other",
+        ] {
+            assert!(parse_direct_plan(command).is_none(), "{command}");
+        }
     }
 
     #[test]
