@@ -1,6 +1,7 @@
 //! Controlled child-process execution for embedded RTK callers.
 
 use command_group::{CommandGroup, GroupChild};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
@@ -259,7 +260,7 @@ fn spawn_reader(
     limit: usize,
 ) -> JoinHandle<io::Result<CapturedStream>> {
     thread::spawn(move || {
-        let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+        let mut tail = VecDeque::with_capacity(limit.min(8 * 1024));
         let mut buffer = [0_u8; 8 * 1024];
         let mut truncated = false;
         loop {
@@ -267,13 +268,37 @@ fn spawn_reader(
             if read == 0 {
                 break;
             }
-            let available = limit.saturating_sub(bytes.len());
-            let retained = read.min(available);
-            bytes.extend_from_slice(&buffer[..retained]);
-            truncated |= retained < read;
+            truncated |= append_tail(&mut tail, &buffer[..read], limit);
         }
-        Ok(CapturedStream { bytes, truncated })
+        Ok(CapturedStream {
+            bytes: tail.into_iter().collect(),
+            truncated,
+        })
     })
+}
+
+/// Retain only the newest `limit` bytes, returning whether bytes were dropped.
+fn append_tail(tail: &mut VecDeque<u8>, chunk: &[u8], limit: usize) -> bool {
+    if chunk.is_empty() {
+        return false;
+    }
+    if limit == 0 {
+        tail.clear();
+        return true;
+    }
+    if chunk.len() >= limit {
+        let truncated = !tail.is_empty() || chunk.len() > limit;
+        tail.clear();
+        tail.extend(&chunk[chunk.len() - limit..]);
+        return truncated;
+    }
+
+    let overflow = tail.len().saturating_add(chunk.len()).saturating_sub(limit);
+    if overflow > 0 {
+        tail.drain(..overflow);
+    }
+    tail.extend(chunk);
+    overflow > 0
 }
 
 fn collect_output(
@@ -289,4 +314,38 @@ fn collect_output(
         .map_err(|_| ProcessError::Read(io::Error::other("stderr reader thread panicked")))?
         .map_err(ProcessError::Read)?;
     Ok((stdout, stderr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_tail_evicts_oldest_bytes_across_chunks() {
+        let mut tail = VecDeque::new();
+
+        assert!(!append_tail(&mut tail, b"START", 8));
+        assert!(append_tail(&mut tail, b"-MIDDLE-", 8));
+        assert!(append_tail(&mut tail, b"END", 8));
+
+        assert_eq!(tail.into_iter().collect::<Vec<_>>(), b"DDLE-END");
+    }
+
+    #[test]
+    fn append_tail_keeps_end_of_chunk_larger_than_limit() {
+        let mut tail = VecDeque::from(b"old".to_vec());
+
+        assert!(append_tail(&mut tail, b"0123456789-END", 6));
+
+        assert_eq!(tail.into_iter().collect::<Vec<_>>(), b"89-END");
+    }
+
+    #[test]
+    fn append_tail_with_zero_limit_discards_everything() {
+        let mut tail = VecDeque::from(b"old".to_vec());
+
+        assert!(append_tail(&mut tail, b"new", 0));
+
+        assert!(tail.is_empty());
+    }
 }

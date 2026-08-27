@@ -122,9 +122,16 @@ fn timeout_terminates_descendant_processes() {
 
 #[cfg(unix)]
 #[test]
-fn stdout_and_stderr_capture_are_independently_bounded() {
+fn stdout_and_stderr_capture_retain_their_bounded_tails() {
     let options = ExecuteOptions::default().with_output_limit(128);
-    let command = "head -c 4096 /dev/zero | tr '\\0' x; head -c 4096 /dev/zero | tr '\\0' y >&2";
+    let command = concat!(
+        "printf STDOUT_START; ",
+        "head -c 4096 /dev/zero | tr '\\0' x; ",
+        "printf STDOUT_END; ",
+        "{ printf STDERR_START; ",
+        "head -c 4096 /dev/zero | tr '\\0' y; ",
+        "printf STDERR_END; } >&2"
+    );
 
     let result = execute_with_options(command, &options).expect("capture bounded output");
 
@@ -132,6 +139,10 @@ fn stdout_and_stderr_capture_are_independently_bounded() {
     assert_eq!(result.stderr.len(), 128);
     assert!(result.stdout_truncated);
     assert!(result.stderr_truncated);
+    assert!(!result.stdout.contains("STDOUT_START"));
+    assert!(!result.stderr.contains("STDERR_START"));
+    assert!(result.stdout.ends_with("STDOUT_END"), "{}", result.stdout);
+    assert!(result.stderr.ends_with("STDERR_END"), "{}", result.stderr);
 }
 
 #[test]
